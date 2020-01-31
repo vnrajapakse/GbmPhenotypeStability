@@ -1,0 +1,784 @@
+---
+title: "Deconvolving TCGA GBM Sample Exp. Relative to Attractor-Matched IVY-GAP Sample Exp."
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+
+```{r prep_data, warning=FALSE, message=FALSE}
+library(fgsea)
+library(msigdbr)
+library(org.Hs.eg.db)
+library(reactome.db)
+library(survival)
+
+library(GbmPhenotypeStability)
+source('R/utils.R')
+source('R/gbmdyn.R')
+
+library(tidyverse)
+
+# set parameters ----------------------------------------------
+dataset_name <- 'GBM (TCGA)'
+exp_tbl <- GbmPhenotypeStability::tcga_pancan_gbm$exp
+gene_colname <- 'gene'
+srv_tbl <- GbmPhenotypeStability::tcga_pancan_gbm$surv
+
+###############################################################
+iv2attr <- GbmPhenotypeStability::ivygap$pwattr_match_tbl
+###############################################################
+# -------------------------------------------------------------
+
+if (!('study' %in% colnames(srv_tbl))){
+  srv_tbl <- srv_tbl %>%
+    mutate(
+      study = dataset_name
+    )
+}
+
+# Add phenotype information to iv2attr ------------------------
+pwattr_match_tbl <- iv2attr
+iv2attr <- iv2attr %>%
+  left_join(GbmPhenotypeStability::pwattr_tbl %>% dplyr::select(pwattr_uid, phenotype), 
+            by = 'pwattr_uid') %>%
+  mutate(
+    phenotype = map_chr(phenotype, function(x) paste0(x, collapse = '_'))
+  ) 
+
+get_matched_sample_ivygap_exp <- function(exp_tbl, 
+                                          iv2attr = pwattr_match_tbl) {
+  ivx <- GbmPhenotypeStability::ivygap$exp %>% rename(gene = gene_symbol)
+  iva <- GbmPhenotypeStability::ivygap$samples
+  
+  # Restrict IVY-GAP to attractor-matched samples -------------------------------
+  stopifnot(
+  is.character(iv2attr$sample_id),
+  all(iv2attr$sample_id %in% colnames(ivx)),
+  all(iv2attr$sample_id %in% iva$sample_id)
+  )
+  ivx <- ivx %>% dplyr::select(c('gene', iv2attr$sample_id))
+  iva <- iva %>% filter(sample_id %in% iv2attr$sample_id)
+  stopifnot(
+    identical(colnames(ivx)[-1], iv2attr$sample_id),
+    identical(iva$sample_id, iv2attr$sample_id)
+  )
+  
+  # Restrict gene expression data tables to shared genes ------------------------
+  shared_genes <- intersect(exp_tbl$gene, ivx$gene)
+  exp_tbl <- exp_tbl %>% filter(gene %in% shared_genes) %>% arrange(gene)
+  ivx     <- ivx     %>% filter(gene %in% shared_genes) %>% arrange(gene)
+  
+  exp_mat <- tbl_to_mat(exp_tbl, rowname_col = 'gene')
+  ivx_mat <- tbl_to_mat(ivx, rowname_col = 'gene')
+  stopifnot(identical(rownames(exp_mat), rownames(ivx_mat)))
+  
+  result <- list()
+  result[['exp_mat']] <- exp_mat
+  result[['ivx_mat']] <- ivx_mat
+  result
+}
+
+tmp <- get_matched_sample_ivygap_exp(exp_tbl, iv2attr)
+exp_mat <- tmp$exp_mat
+ivx_mat <- tmp$ivx_mat
+stopifnot(
+  identical(rownames(ivx_mat), rownames(exp_mat)),
+  identical(colnames(ivx_mat), iv2attr$sample_id)
+  )
+
+# Define gene sets -------------------------------------------------------
+bn_gene_tbl <- readr::read_tsv('inst/extdata/gbm_bn_genes.txt')
+bngenes <- na.exclude(c(bn_gene_tbl[[1]], bn_gene_tbl[[2]])) %>%
+  stringr::str_split(pattern = '\\s+') %>%
+  c(recursive = TRUE) %>%
+  unique() %>% sort() %>%
+  intersect(rownames(exp_mat))
+
+exp_mat_full <- exp_mat
+# Restrict to gene sets -------------------------------------------------------
+genes <- bngenes
+exp_mat <- exp_mat[genes, , drop = FALSE]
+ivx_mat <- ivx_mat[genes, , drop = FALSE]
+
+```
+
+
+### GBM Expression-Based Subtype Classification (Proneural, Classical, Mesenchymal)
+
+```{r subtype_classification}
+gbm_subtype_tbl <- readr::read_tsv('inst/extdata/tcga_gbm_classification/NIHMS885291-supplement-3.txt',
+                                   col_types = cols())
+
+identical(
+  stringr::str_sub(gbm_subtype_tbl$Sample_Id_RNAseq, 1, nchar(gbm_subtype_tbl$Sample_Id_U133A)),
+  gbm_subtype_tbl$Sample_Id_U133A
+) %>% stopifnot()
+
+abbr2subtype = c(CL = 'Classical', MS = 'Mesenchymal', PN = 'Proneural')
+
+gbm_subtype_tbl <- gbm_subtype_tbl %>%
+  mutate(
+    sample = stringr::str_replace_all(Sample_Id_U133A, pattern = '\\.', replacement = '-'),
+    Subtype = abbr2subtype[Subtype]
+  ) %>%
+  dplyr::select(sample, everything())
+
+srv_tbl <- left_join(srv_tbl, gbm_subtype_tbl %>% dplyr::select(sample, Subtype), by = 'sample')
+
+```
+
+------
+
+### IVY-GAP Deconvolution Basis Set p_Go by Location
+```{r ivygap_pgo_loc_plot}
+set.seed(1)
+
+iv2attr %>%
+  dplyr::select(sample_id, location, stem_cluster_status, 
+         p_Go, p_Grow, p_Dormant, p_Apoptosis) %>%
+  gather(key = "p_Phenotype", value = "probability", p_Go:p_Apoptosis) %>%
+  mutate(
+    p_Phenotype = factor(p_Phenotype, levels = c(
+      "p_Go", "p_Grow", "p_Dormant", "p_Apoptosis"
+    ))
+  ) %>%
+  ggplot(aes(x = location, y = probability, color = stem_cluster_status)) +
+  geom_jitter(width = 0.20) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  facet_grid(rows = vars(p_Phenotype)) +
+  xlab("") +
+  ggtitle("Attractor-Matched IVY-GAP Samples: p_Phenotype by Location") +
+  theme(plot.title = element_text(size=10, face = "bold")) 
+
+```
+
+
+
+### PCA Projection of IVY-GAP Deconvolution Basis Samples
+```{r ivgap_pca}
+set.seed(1)
+ivx_pca <- ivx_mat[!near(apply(ivx_mat, MARGIN = 1, sd), 0), , drop=FALSE]
+ivgp_pcout <- pca(t(ivx_pca))
+iv2attr2 <- left_join(iv2attr, tibble(
+    sample_id = rownames(ivgp_pcout$dat),
+    PC1 = ivgp_pcout$dat[, 'PC1'],
+    PC2 = ivgp_pcout$dat[, 'PC2'],
+    PC3 = ivgp_pcout$dat[, 'PC3']
+  ), 
+  by = 'sample_id'
+)
+
+ggplot(iv2attr2, aes(x = PC1, y = PC2, color = location,
+                     shape = stem_cluster_status)) +
+  geom_point() +
+  xlab(paste0('PC1 (', round(ivgp_pcout$pctVar[1]*100, 1), '% Variance)')) +
+  ylab(paste0('PC2 (', round(ivgp_pcout$pctVar[2]*100, 1), '% Variance)')) +
+  labs(title = 'PCA Projection of IVY-GAP Deconvolution Basis Samples')
+
+
+ggplot(iv2attr2, aes(x = PC1, y = PC2, color = p_Go,
+                     shape = stem_cluster_status)) +
+  geom_point() +
+  xlab(paste0('PC1 (', round(ivgp_pcout$pctVar[1]*100, 1), '% Variance)')) +
+  ylab(paste0('PC2 (', round(ivgp_pcout$pctVar[2]*100, 1), '% Variance)')) +
+  labs(title = 'PCA Projection of IVY-GAP Deconvolution Basis Samples')
+
+ggplot(iv2attr2, aes(x = PC1, y = PC2, color = PC3,
+                     shape = stem_cluster_status)) +
+  geom_point() +
+  xlab(paste0('PC1 (', round(ivgp_pcout$pctVar[1]*100, 1), '% Variance)')) +
+  ylab(paste0('PC2 (', round(ivgp_pcout$pctVar[2]*100, 1), '% Variance)')) +
+  labs(title = 'PCA Projection of IVY-GAP Deconvolution Basis Samples')
+```
+
+
+------
+
+### Deconvolution with respect to attractor-matched IVY-GAP samples, pGo computation
+```{r dconv_tbl}
+
+get_deconv_tbl <- function(iv2attr, ivx_mat, exp_mat) {
+  dconv_tbl <- tibble(
+    sample_id = colnames(exp_mat),
+    p_Go = NA,
+    p_Grow = NA,
+    p_Dormant = NA,
+    p_Apoptosis = NA,
+    mean_sq_err = NA,
+    r = NA,
+    p = NA,
+    dconv_samples = vector(mode = 'list', length = ncol(exp_mat)),
+    w = vector(mode = 'list', length = ncol(exp_mat)),
+    w_norm = vector(mode = 'list', length = ncol(exp_mat)),
+    w_jcweighted_norm = vector(mode = 'list', length = ncol(exp_mat))
+  )
+
+  for (i in seq_len(nrow(dconv_tbl))) {
+    si <- dconv_tbl[[i, 'sample_id']]
+    tmp <- nnls::nnls(A = ivx_mat, b = exp_mat[, si, drop = TRUE])
+
+    dconv_tbl[[i, 'mean_sq_err']] <- tmp$deviance / nrow(exp_mat)
+
+    wvec <- sort(set_names(tmp$x, colnames(ivx_mat)), decreasing = TRUE)
+    wvec <- wvec[!near(wvec, 0)]
+    dconv_tbl[[i, 'dconv_samples']] <- names(wvec)
+    dconv_tbl[[i, 'w']] <- wvec
+    dconv_tbl[[i, 'w_norm']] <- wvec / sum(abs(wvec))
+
+    stopifnot(
+      all(dconv_tbl[[i, 'w_norm']] > 0),
+      near(sum(dconv_tbl[[i, 'w_norm']]), 1)
+    )
+
+    cor_out <- cor.test(tmp$fitted, exp_mat[, si, drop = TRUE])
+    dconv_tbl[[i, 'r']] <- cor_out$estimate
+    dconv_tbl[[i, 'p']] <- cor_out$p.value
+
+    # REFACTOR --------------------------------------------------------------
+    pgo_vec <- iv2attr %>%
+      filter(sample_id %in% names(wvec)) %>%
+      dplyr::select(sample_id, p_Go) %>%
+      deframe() %>%
+      .[names(wvec)]
+    stopifnot(identical(names(wvec), names(pgo_vec)))
+
+    pgrow_vec <- iv2attr %>%
+      filter(sample_id %in% names(wvec)) %>%
+      dplyr::select(sample_id, p_Grow) %>%
+      deframe() %>%
+      .[names(wvec)]
+    stopifnot(identical(names(wvec), names(pgrow_vec)))
+
+    pdormant_vec <- iv2attr %>%
+      filter(sample_id %in% names(wvec)) %>%
+      dplyr::select(sample_id, p_Dormant) %>%
+      deframe() %>%
+      .[names(wvec)]
+    stopifnot(identical(names(wvec), names(pdormant_vec)))
+
+    papop_vec <- iv2attr %>%
+      filter(sample_id %in% names(wvec)) %>%
+      dplyr::select(sample_id, p_Apoptosis) %>%
+      deframe() %>%
+      .[names(wvec)]
+    stopifnot(identical(names(wvec), names(papop_vec)))
+
+    jac_vec <- iv2attr %>%
+      filter(sample_id %in% names(wvec)) %>%
+      dplyr::select(sample_id, jaccard_score) %>%
+      deframe() %>%
+      .[names(wvec)]
+    stopifnot(all(jac_vec > 0),
+      identical(names(wvec), names(jac_vec)))
+    # REFACTOR (END) --------------------------------------------------------
+
+    w <- dconv_tbl[[i, 'w_norm']] * jac_vec
+    w <- w / sum(w)
+    stopifnot(near(sum(w), 1))
+
+    dconv_tbl[[i, 'p_Go']] <- sum(w * pgo_vec)
+    dconv_tbl[[i, 'p_Grow']] <- sum(w * pgrow_vec)
+    dconv_tbl[[i, 'p_Dormant']] <- sum(w * pdormant_vec)
+    dconv_tbl[[i, 'p_Apoptosis']] <- sum(w * papop_vec)
+
+    dconv_tbl[[i, 'w_jcweighted_norm']] <- w
+  }
+  select(dconv_tbl, p_Go, p_Grow, p_Dormant, p_Apoptosis) %>%
+    mutate(p_All = p_Go + p_Grow + p_Dormant + p_Apoptosis) %>%
+    pull(p_All) %>% near(1) %>% all() %>% stopifnot()
+
+  dconv_tbl <- dconv_tbl %>%
+    left_join(srv_tbl, by = c('sample_id' = 'sample')) %>%
+    dplyr::select(sample_id, survival, status, gender, age,
+                  p_Go, p_Grow, p_Dormant, p_Apoptosis,
+                  everything())
+
+  return(dconv_tbl)
+}
+
+dconv_tbl <- get_deconv_tbl(iv2attr, ivx_mat, exp_mat)
+
+```
+
+
+```{r write_out_deconv_tbl}
+
+tcga_surv_pGo_tbl <- dconv_tbl %>%
+  mutate(
+    p_Go_Group = ifelse(p_Go > quantile(p_Go, 0.66), 'high', 'low'),
+    p = p.adjust(p, method = "fdr")
+  ) %>%
+  select(-w_norm) %>%
+  rename(
+    p_adjusted = p,
+    dconv_sample_coeff_wts = w,
+    normalized_jc_x_dconv_sample_coeff_wts = w_jcweighted_norm
+  ) %>%
+  select(sample_id, study, Subtype, p_Go_Group, everything())
+  
+#usethis::use_data(tcga_surv_pGo_tbl)
+
+stopifnot(identical(GbmPhenotypeStability::tcga_surv_pGo_tbl, tcga_surv_pGo_tbl))
+
+# writexl::write_xlsx(
+#   tcga_surv_pGo_tbl %>%
+#     mutate(
+#       dconv_sample_coeff_wts = purrr::map(dconv_sample_coeff_wts,
+#                                           round, digits = 3),
+#       normalized_jc_x_dconv_sample_coeff_wts = purrr::map(normalized_jc_x_dconv_sample_coeff_wts,
+#                                                           round, digits = 3)
+#     ) %>%
+#     mutate_if(is.list, function(L) {
+#       purrr::map_chr(L, function(vec) { paste0(vec, collapse = ", ") })
+#   }),
+#   "inst/extdata/Sup_Tables/Table_S7_tcga_gbm_pGo_table.xlsx")
+
+```
+
+
+-------------------------------------------------------------------------------
+
+### COX PH (pPheno, Age, Subtype)
+
+```{r}
+stopifnot(identical(dconv_tbl$p_Go, GbmPhenotypeStability::tcga_surv_pGo_tbl$p_Go))
+
+gbm_surv <- dconv_tbl %>% filter(!is.na(Subtype))
+Age <- gbm_surv$age
+GBM_Subtype <- factor(ifelse(gbm_surv$Subtype == "Proneural", "Proneural", "Classical_Mesenchymal"),
+                      levels = c("Proneural", "Classical_Mesenchymal"))
+pGo_x_100 <- gbm_surv$p_Go * 100
+pGrow_x_100 <- gbm_surv$p_Grow * 100
+pDormant_x_100 <- gbm_surv$p_Dormant * 100
+pApoptosis_x_100 <- gbm_surv$p_Apoptosis * 100 
+
+coxph(Surv(gbm_surv$survival, gbm_surv$status) ~ Age + GBM_Subtype + pGo_x_100)
+
+coxph(Surv(gbm_surv$survival, gbm_surv$status) ~ Age + GBM_Subtype + pGrow_x_100)
+
+coxph(Surv(gbm_surv$survival, gbm_surv$status) ~ Age + GBM_Subtype + pDormant_x_100)
+
+coxph(Surv(gbm_surv$survival, gbm_surv$status) ~ Age + GBM_Subtype + pApoptosis_x_100)
+```
+
+```{r}
+gbm_surv <- dconv_tbl %>% filter(!is.na(Subtype))
+#Age <- gbm_surv$age
+GBM_Subtype <- factor(gbm_surv$Subtype, levels = c("Proneural", "Classical", "Mesenchymal"))
+
+coxph(Surv(gbm_surv$survival, gbm_surv$status) ~ GBM_Subtype)
+
+```
+
+```{r}
+plot_km <- function(surv_tbl, legend_labels,
+                    title_str = "", lo_surv_group = NULL, hi_surv_group = NULL) {
+  stopifnot(is.factor(surv_tbl$strat_factor),
+            identical(names(legend_labels), levels(surv_tbl$strat_factor)))
+  
+  # -----------------------------------------------------------------------------------------
+  surv_obj <- Surv(surv_tbl$survival, surv_tbl$status)
+  survdiff_out <- survdiff(surv_obj ~ surv_tbl$strat_factor, rho=0)
+  survdiff_pval <- (1 - pchisq(survdiff_out$chisq, length(survdiff_out$n) - 1)) %>% signif(3)
+  
+  title_str <- paste0(title_str, " (logrank test p = ", survdiff_pval, ")")
+  plot(survfit(surv_obj ~ surv_tbl$strat_factor),
+    xlab = 'time (days)',
+    ylab = 'Survival Probability',
+    col = c('red', 'blue'), lwd = 2,
+    main = title_str)
+  
+  legend('topright', legend = legend_labels, col = c('red', 'blue'), lwd = 2)
+  # -----------------------------------------------------------------------------------------
+  
+  if ((!is.null(lo_surv_group)) && (!is.null(hi_surv_group))) {
+    stopifnot(
+      lo_surv_group %in% levels(surv_tbl$strat_factor),
+      hi_surv_group %in% levels(surv_tbl$strat_factor),
+      filter(surv_tbl, strat_factor == lo_surv_group) %>% pull(survival) %>% median()
+      <
+      filter(surv_tbl, strat_factor == hi_surv_group) %>% pull(survival) %>% median()
+    )
+  }
+}
+```
+
+
+## KM Plot: TCGA GBM by p_Go
+```{r}
+pgo_surv_tbl <- dconv_tbl %>% 
+  select(sample_id, survival, status, p_Go, Subtype) %>%
+  mutate(
+    strat_factor = factor(ifelse(p_Go > quantile(p_Go, 0.66), 'high', 'low'),
+                          levels = c('high', 'low'))
+  ) %>%
+  select(sample_id, survival, status, strat_factor, everything())
+  
+plot_km(
+  surv_tbl = pgo_surv_tbl,
+  legend_labels = c(high = "High p_Go Group", low = "Low p_Go Group"),
+  title_str = "TCGA GBM",
+  lo_surv_group = "high",
+  hi_surv_group = "low"
+)
+```
+
+
+## KM Plot: TCGA GBM, Proneural vs. Classical_Mesenchymal
+```{r}
+subtype_surv_tbl <- dconv_tbl %>% 
+  select(sample_id, survival, status, Subtype) %>%
+  filter(!is.na(Subtype)) %>%
+  mutate(
+    strat_factor = factor(ifelse(Subtype == "Proneural", "Proneural", "Classical_Mesenchymal"),
+                          levels = c('Classical_Mesenchymal', 'Proneural'))
+  ) %>%
+  select(sample_id, survival, status, strat_factor, everything())
+  
+plot_km(
+  surv_tbl = subtype_surv_tbl,
+  legend_labels = c(Classical_Mesenchymal = "Classical_Mesenchymal",
+                    Proneural = "Proneural"),
+  title_str = "TCGA GBM",
+  lo_surv_group = "Classical_Mesenchymal",
+  hi_surv_group = "Proneural"
+)
+```
+
+
+
+## KM Plot: TCGA GBM (Classical_Mesenchymal) by p_Go
+```{r}
+pgo_surv_tbl_CM <- dconv_tbl %>% 
+  select(sample_id, survival, status, p_Go, Subtype) %>%
+  filter(Subtype %in% c("Classical", "Mesenchymal")) %>%
+  mutate(
+    strat_factor = factor(ifelse(p_Go > quantile(p_Go, 0.66), 'high', 'low'),
+                          levels = c('high', 'low'))
+  ) %>%
+  select(sample_id, survival, status, strat_factor, everything())
+  
+plot_km(
+  surv_tbl = pgo_surv_tbl_CM,
+  legend_labels = c(high = "High p_Go Group", low = "Low p_Go Group"),
+  title_str = "TCGA Classical+Mesenchymal GBM",
+  lo_surv_group = "high",
+  hi_surv_group = "low"
+)
+```
+
+
+## KM Plot: TCGA GBM (Proneural) by p_Go
+```{r}
+pgo_surv_tbl_P <- dconv_tbl %>% 
+  select(sample_id, survival, status, p_Go, Subtype) %>%
+  filter(Subtype == "Proneural") %>%
+  mutate(
+    strat_factor = factor(ifelse(p_Go > quantile(p_Go, 0.66), 'high', 'low'),
+                          levels = c('high', 'low'))
+  ) %>%
+  select(sample_id, survival, status, strat_factor, everything())
+  
+plot_km(
+  surv_tbl = pgo_surv_tbl_P,
+  legend_labels = c(high = "High p_Go Group", low = "Low p_Go Group"),
+  title_str = "TCGA Proneural GBM",
+  lo_surv_group = "high",
+  hi_surv_group = "low"
+)
+```
+
+
+## KM Plot: TCGA GBM by p_Dormant
+```{r}
+pdormant_surv_tbl <- dconv_tbl %>% 
+  select(sample_id, survival, status, p_Dormant, Subtype) %>%
+  mutate(
+    strat_factor = factor(ifelse(p_Dormant > quantile(p_Dormant, 0.66), 'high', 'low'),
+                          levels = c('low', 'high'))
+  ) %>%
+  select(sample_id, survival, status, strat_factor, everything())
+  
+plot_km(
+  surv_tbl = pdormant_surv_tbl,
+  legend_labels = c(low = "Low p_Dormant Group", high = "High p_Dormant Group"),
+  title_str = "TCGA GBM" ,
+  lo_surv_group = "low",
+  hi_surv_group = "high"
+)
+```
+
+
+## KM Plot: TCGA GBM by p_Grow
+```{r}
+pgrow_surv_tbl <- dconv_tbl %>% 
+  select(sample_id, survival, status, p_Grow, Subtype) %>%
+  mutate(
+    strat_factor = factor(ifelse(p_Grow > quantile(p_Grow, 0.66), 'high', 'low'),
+                          levels = c('low', 'high'))
+  ) %>%
+  select(sample_id, survival, status, strat_factor, everything())
+  
+plot_km(
+  surv_tbl = pgrow_surv_tbl,
+  legend_labels = c(low = "Low p_Grow Group", high = "High p_Grow Group"),
+  title_str = "TCGA GBM" ,
+  lo_surv_group = "low",
+  hi_surv_group = "high"
+)
+```
+
+
+```{r}
+papop_surv_tbl <- dconv_tbl %>% 
+  select(sample_id, survival, status, p_Apoptosis, Subtype) %>%
+  mutate(
+    strat_factor = factor(ifelse(p_Apoptosis > quantile(p_Apoptosis, 0.66), 'high', 'low'),
+                          levels = c('high', 'low'))
+  ) %>%
+  select(sample_id, survival, status, strat_factor, everything())
+  
+plot_km(
+  surv_tbl = papop_surv_tbl,
+  legend_labels = c(high = "High p_Apoptosis Group", low = "Low p_Apoptosis Group"),
+  title_str = "TCGA GBM",
+  lo_surv_group = "high",
+  hi_surv_group = "low"
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+stopifnot(identical(rownames(exp_mat), rownames(ivgp_pcout$evecs)))
+stopifnot(identical(rownames(ivx_mat), rownames(ivgp_pcout$evecs)))
+
+#cor.test(apply(ivx_mat, 1, mean), apply(exp_mat, 1, mean), method = "spearman")
+#cor.test(apply(ivx_mat, 1, sd), apply(exp_mat, 1, sd), method = "spearman")
+
+exp_mat_4pca <- scale(t(exp_mat))
+stopifnot(
+  all(near(colMeans(exp_mat_4pca), 0)),
+  all(near(apply(exp_mat_4pca, 2, sd), 1))
+)
+ivx_pc1_wts <- -ivgp_pcout$evecs[, "PC1", drop = FALSE]
+
+stopifnot(identical(colnames(exp_mat_4pca), rownames(ivx_pc1_wts)))
+exp_wrt_ivx_pc1 <- (exp_mat_4pca %*% ivx_pc1_wts)[, 1, drop = TRUE] %>%
+  enframe(name = "sample_id", value = "ivx_pc1_weighted_exp") %>%
+  left_join(dconv_tbl, by = "sample_id") %>%
+  mutate(
+    ivx_pc1_wtexp_group = factor(ifelse(ivx_pc1_weighted_exp > quantile(ivx_pc1_weighted_exp, probs=0.66),
+                                        'high', 'low'),  levels = c('high', 'low'))
+  )
+
+srv_obj_ivx_pca <- Surv(exp_wrt_ivx_pc1$survival, exp_wrt_ivx_pc1$status)
+
+
+title_str = "TCGA GBM Stratified by IVY-GAP PC1 Weighted Expression"
+plot(survfit(srv_obj_ivx_pca ~ exp_wrt_ivx_pc1$ivx_pc1_wtexp_group),
+     xlab = 'time (days)',
+     ylab = 'Survival Probability',
+     col = c('red', 'blue'), lwd = 2,
+     main = title_str)
+
+legend('topright', 
+       legend = c('High PC1-Weighted Expression', 'Low PC1-Weighted Expression'),
+       col = c('red', 'blue'), lwd = 2)
+
+survdiff(srv_obj_ivx_pca ~ exp_wrt_ivx_pc1$ivx_pc1_wtexp_group, rho=0)
+```
+
+```{r}
+ggplot(exp_wrt_ivx_pc1, aes(x = ivx_pc1_weighted_exp, y = p_Go,
+                            color = Subtype)) +
+  geom_point() +
+  ggtitle("TCGA GBM: Computed p_Go vs. IVY-GAP PC1-Weighted Gene Expression", 
+         subtitle = "Spearman Correlation = 0.127,  p = 0.102")
+
+cor.test(exp_wrt_ivx_pc1$ivx_pc1_weighted_exp, exp_wrt_ivx_pc1$p_Go, method = "spearman")
+```
+
+
+### P_Go Versus (Bulk Expression-Based) Subtypes
+
+```{r pgo_vs_subtype}
+if (dataset_name == 'GBM (TCGA)') {
+  subtype_pgo_tbl <- dplyr::select(dconv_tbl, sample_id, p_Go, Subtype) %>%
+    filter(!is.na(Subtype))
+  
+  p <- ggplot(subtype_pgo_tbl, aes(x = reorder(Subtype, p_Go, FUN = median), y = p_Go)) +
+    geom_violin() +
+    geom_boxplot(width = 0.15) +
+    ggbeeswarm::geom_beeswarm(size = 0.85) +
+    xlab(label = '') +
+    labs(title = 'Distribution of p_Go in GBM Subtypes (TCGA)')
+  
+  p
+}
+```
+
+
+## GENOMIC ASSOCIATIONS WITH P_GO FROM HERE
+-------------------------------------------------------------------------------
+
+### P_Go Versus Gene Expression
+
+```{r p_go_cors}
+sample_to_pgo <- deframe(dconv_tbl %>% dplyr::select(sample_id, p_Go))
+stopifnot(identical(colnames(exp_mat_full), names(sample_to_pgo)))
+
+pw_subcategory <- 'CP:REACTOME' 
+pathways <- msigdbr(species = "Homo sapiens",
+                    category = 'C2', subcategory = pw_subcategory) %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+ccors_out <- crossCors(exp_mat_full, sample_to_pgo, method = 'spearman')
+
+pgo_cor_tbl <- tibble(
+  gene = rownames(ccors_out$cor),
+  exp_pgo_cor = ccors_out$cor[, 1],
+  exp_pgo_pval = ccors_out$pval[, 1]
+) %>%
+  filter(!is.na(exp_pgo_cor)) %>%
+  arrange(exp_pgo_cor) 
+
+# SAVE DATA -------------------------------
+# tcga_gbm <- list()
+# tcga_gbm$pgo <- sample_to_pgo
+# tcga_gbm$exp <- exp_mat_full
+
+#usethis::use_data(tcga_gbm)
+#usethis::use_data(pgo_cor_tbl)
+# -----------------------------------------
+
+```
+
+
+```{r}
+set.seed(2)
+gsea_ranks <- deframe(pgo_cor_tbl %>% dplyr::select(gene, exp_pgo_cor))
+fgseaRes <- fgsea(pathways, gsea_ranks, nperm=1000, maxSize=500) %>%
+  filter(padj < 0.05) %>%
+  as_tibble() %>%
+  arrange(NES)
+
+# writexl::write_xlsx(
+#   fgseaRes %>%
+#     mutate_if(is.list, function(L) {
+#       purrr::map_chr(L, function(vec) { paste0(vec, collapse = ", ") })
+#   }),
+#   "inst/extdata/Sup_Tables/Table_S8_tcga_gbm_pgo_vs_exp_correlation_gsea_table.xlsx")
+
+# SAVE DATA -------------------------------
+# pgo_gsea_tbl <- fgseaRes
+# usethis::use_data(pgo_gsea_tbl)
+# -----------------------------------------
+
+# https://academic.oup.com/neuro-oncology/article/12/11/1113/1139916
+#pgo_cor_tbl %>% filter(gene %in% c('CCL2','GDF15', 'IL10', 'IL23A')) 
+
+```
+
+
+```{r gsea_plot}
+k <- 12
+
+long_pw_name <- "IMMUNOREGULATORY_INTERACTIONS_BETWEEN_A_LYMPHOID_AND_A_NON_LYMPHOID_CELL"
+short_pw_name <- "IMMUNOREGULATORY_INTERACTIONS_[...]"
+
+fgseaRes_top <- fgseaRes[c(1:k, (nrow(fgseaRes)-k+1):nrow(fgseaRes)), ] %>%
+  arrange(NES) %>%
+  mutate(
+    pathway_label = purrr::map_chr(pathway, function(s) {
+      stringr::str_split(s, "REACTOME_")[[1]][[2]]
+    }), 
+    pathway_color = c(rep('red', k), rep('blue', k))
+  ) %>%
+  mutate(
+    pathway_label = ifelse(pathway_label == long_pw_name, short_pw_name, pathway_label) 
+  )
+
+p <- ggplot(fgseaRes_top, aes(x = reorder(pathway_label, NES), y = NES)) +
+  geom_bar(stat = 'identity', mapping = aes(fill = pathway_color)) +
+  ylab('Normalized Enrichment Score (NES)') +
+  xlab('') +
+  labs(title = 'Leading p_Go-Associated REACTOME Pathways',
+       subtitle = '-- based on GSEA of TCGA GBM p_Go vs gene expression correlations (Spearman)') +
+  theme_bw() +
+  theme(legend.position = 'none') +
+  coord_flip()
+
+ggsave(p, filename = 'inst/extdata/figs/fig4_pgo_gsea.pdf', width = 12, height = 10)
+
+```
+
+
+```{r}
+stopifnot(identical(colnames(exp_mat_full), names(sample_to_pgo)))
+stopifnot(all(c('CCL2', 'GDF15', 'IL23A', 'IL10') %in% rownames(exp_mat_full)))
+
+get_exp_pgo_cor_label <- function(gene_name) {
+  gene_pgo_cor <- filter(pgo_cor_tbl, gene == gene_name)
+  paste0(
+    gene_pgo_cor %>% pull(gene), 
+    " (Spearman rho = ",
+    gene_pgo_cor %>% pull(exp_pgo_cor) %>% round(3),
+    " p = ",
+    gene_pgo_cor %>% pull(exp_pgo_pval) %>% signif(3),
+    ")"
+  )
+}
+
+CCL2_pgo_cor_label <- get_exp_pgo_cor_label("CCL2")
+GDF15_pgo_cor_label <- get_exp_pgo_cor_label("GDF15")
+IL23A_pgo_cor_label <- get_exp_pgo_cor_label("IL23A")
+IL10_pgo_cor_label <- get_exp_pgo_cor_label("IL10")
+
+pgo_exp_plot_tbl <- tibble(
+  sample = names(sample_to_pgo),
+  p_Go = sample_to_pgo,
+  CCL2 = exp_mat_full['CCL2', ,   drop = TRUE],
+  GDF15 = exp_mat_full['GDF15', , drop = TRUE],
+  IL23A = exp_mat_full['IL23A', , drop = TRUE],
+  IL10 = exp_mat_full['IL10', ,   drop = TRUE]
+) %>%
+  gather(key = 'gene', value = 'exp', CCL2, GDF15, IL23A, IL10) %>%
+  mutate(gene = ifelse(gene == 'CCL2',  CCL2_pgo_cor_label,  gene)) %>%
+  mutate(gene = ifelse(gene == 'GDF15', GDF15_pgo_cor_label, gene)) %>%
+  mutate(gene = ifelse(gene == 'IL23A', IL23A_pgo_cor_label, gene)) %>%
+  mutate(gene = ifelse(gene == 'IL10',  IL10_pgo_cor_label,  gene))
+
+
+#cor.test(sample_to_pgo, exp_mat_full['CCL2', ,   drop = TRUE], method = 'spearman')
+
+p2 <- ggplot(pgo_exp_plot_tbl, aes(x = exp, y = p_Go)) +
+  geom_point(alpha = 0.5) +
+  facet_wrap(~gene) +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    #panel.border = element_blank(),
+    panel.background = element_blank()) +
+  geom_smooth(method = 'lm', size = 0.5, se = FALSE, color = 'black') +
+  xlab('exp: log2[FPKM + 1]') +
+  labs(title = 'p_Go Gene Expression Correlates (TCGA GBM)')
+
+ggsave(p2, filename = 'inst/extdata/figs/fig4_pgo_gene_exp.pdf', width = 8, height = 8)
+```
+
+
+-------------------------------------------------------------------------------

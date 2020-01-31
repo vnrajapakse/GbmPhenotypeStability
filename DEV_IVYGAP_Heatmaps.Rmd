@@ -1,0 +1,196 @@
+---
+title: "Pathway Activity in IVY-GAP"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r prep_data, warning=FALSE, message=FALSE}
+library(tidyverse)
+
+library(GbmPhenotypeStability)
+source('R/utils.R')
+source('R/gbmdyn.R')
+
+# set parameters ----------------------------------------------
+ivx <- GbmPhenotypeStability::ivygap$exp %>% rename(gene = gene_symbol)
+iva <- GbmPhenotypeStability::ivygap$samples
+pathways <- GbmPhenotypeStability::hmgsets_full
+pwattr_tbl <- GbmPhenotypeStability::pwattr_tbl
+# -------------------------------------------------------------
+attr_pwstates <- pwattr_tbl %>%
+  select(HALLMARK_E2F_TARGETS:HALLMARK_TNFA_SIGNALING_VIA_NFKB)
+
+stopifnot(identical(iva$sample_id, colnames(ivx)[-1]))
+
+ivx <- ivx %>% select(c('gene', iva$sample_id))
+stopifnot(identical(iva$sample_id, colnames(ivx)[-1]))
+
+xmat <- tbl_to_mat(ivx, 'gene')
+stopifnot(identical(colnames(xmat), iva$sample_id))
+
+sample_pwstates <- map_sample_exp_to_pathway_states(
+  xmat,
+  pathways
+) %>%
+mutate_all(function(x) { 
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+  }
+)
+rownames(sample_pwstates) <- colnames(xmat)
+
+pwact_mat <- sample_pwstates %>% as.matrix() %>% t()
+sample2loc <- purrr::set_names(iva$location, iva$sample_id)
+
+bn_gene_tbl <- readr::read_tsv('inst/extdata/gbm_bn_genes.txt')
+bngenes <- na.exclude(c(bn_gene_tbl[[1]], bn_gene_tbl[[2]])) %>%
+  stringr::str_split(pattern = '\\s+') %>%
+  c(recursive = TRUE) %>%
+  unique() %>% sort() %>%
+  intersect(rownames(xmat))
+
+```
+
+---------------------------------------------------------------------------------------------------
+
+```{r}
+
+hmivx_tbl <- xmat[bngenes, , drop = FALSE] %>% t() %>% as.data.frame() %>%
+  rownames_to_column(var = "sample_id") %>%
+  as_tibble() %>%
+  left_join(iva %>% select(sample_id, location), by = "sample_id") %>%
+  mutate(
+    attr_matched = sample_id %in% GbmPhenotypeStability::ivygap$pwattr_match_tbl$sample_id
+  ) %>%
+  select(sample_id, location, attr_matched, everything()) %>%
+  arrange(location, desc(attr_matched))
+
+hmiva_tbl <- sample_pwstates %>%
+  rownames_to_column(var = "sample_id") %>%
+  left_join(hmivx_tbl %>% select(sample_id, location, attr_matched), by = "sample_id") %>%
+  select(sample_id, location, attr_matched, everything()) %>%
+  arrange(location, desc(attr_matched))
+
+stopifnot(identical(hmivx_tbl$sample_id, hmiva_tbl$sample_id))
+```
+
+
+```{r}
+split_by_loc <- function(tb) {
+  tb_list <- split(tb, tb$location)
+  result <- list()
+  ordered_locs <- c(
+    "Cellular Tumor", "Perinecrotic Zone", "Pseudopalisading Cells", 
+    "Infiltrating Tumor", "Leading Edge", "Microvascular Proliferation",
+    "Hyperplastic Blood Vessels" 
+  )
+  stopifnot(all(ordered_locs %in% names(tb_list)))
+  
+  result$col_annots <- purrr::map(tb_list, function(tt) {
+    ann <- select(tt, attr_matched) %>%
+      mutate(attr_matched = as.character(attr_matched)) %>%
+      rename(AttractorMatched = attr_matched) %>%
+      as.data.frame()
+    ann_colors <- list("AttractorMatched"=c("TRUE" = "red", "FALSE" = "black"))
+    colAnn <- ComplexHeatmap::HeatmapAnnotation(df=ann, which="col", col=ann_colors, 
+                                annotation_width=unit(c(1, 4), "cm"), 
+                                gap=unit(1, "mm"))
+    return(colAnn)
+  })
+  result$mat_list <- purrr::map(tb_list, function(tt) {
+    tmp <- select(tt, -location, -attr_matched) %>% 
+      as.data.frame() %>% column_to_rownames(var = "sample_id") %>%
+      as.matrix() %>% t()
+    stopifnot(is.numeric(tmp))
+    return(tmp)
+  })
+  
+  result$col_annots <- result$col_annots[ordered_locs]
+  result$mat_list   <- result$mat_list[ordered_locs]
+  stopifnot(identical(names(result$col_annots), names(result$mat_list)))
+  
+  return(result)
+}
+```
+
+
+
+
+```{r}
+library(ComplexHeatmap)
+set.seed(1)
+
+if (exists("tmpx")) { rm("tmpx") }
+if (exists("xmat_list")) { rm("xmat_list") }
+if (exists("xcol_annots")) { rm("xcol_annots") }
+
+tmpa <- split_by_loc(hmiva_tbl)
+amat_list   <- tmpa$mat_list
+acol_annots <- tmpa$col_annots
+
+#pdf("revision_figs/hmaps/ivygap_pwact_and_attr_match.pdf", width = 12, height = 6)
+ComplexHeatmap::Heatmap(amat_list[[1]], row_title="Pathways", 
+                             column_title=names(amat_list)[[1]],
+                             column_title_gp = gpar(fontsize=10),
+                             column_title_rot = 90,
+                             show_column_names = FALSE,
+                             top_annotation_height=unit(1.0,"cm"), 
+                             top_annotation=acol_annots[[1]],
+                             show_row_names = FALSE, show_heatmap_legend = FALSE) +
+  ComplexHeatmap::Heatmap(amat_list[[2]], column_title=names(amat_list)[[2]], 
+                          show_column_names = FALSE,
+                          column_title_gp = gpar(fontsize=10),
+                          column_title_rot = 90,
+                          top_annotation_height=unit(1.0,"cm"), 
+                          top_annotation=acol_annots[[2]],
+                          show_row_names = FALSE, 
+                          show_heatmap_legend = FALSE) +
+  ComplexHeatmap::Heatmap(amat_list[[3]], column_title=names(amat_list)[[3]], 
+                          show_column_names = FALSE, 
+                          column_title_gp = gpar(fontsize=10),
+                          column_title_rot = 90,
+                          top_annotation_height=unit(1.0,"cm"), 
+                          top_annotation=acol_annots[[3]],
+                          show_row_names = FALSE, 
+                          show_heatmap_legend = FALSE) +
+  ComplexHeatmap::Heatmap(amat_list[[4]], column_title=names(amat_list)[[4]],
+                          show_column_names = FALSE, 
+                          column_title_gp = gpar(fontsize=10),
+                          column_title_rot = 90,
+                          top_annotation_height=unit(1.0,"cm"), 
+                          top_annotation=acol_annots[[4]],
+                          show_row_names = FALSE, 
+                          show_heatmap_legend = FALSE) +
+  ComplexHeatmap::Heatmap(amat_list[[5]], column_title=names(amat_list)[[5]],
+                          show_column_names = FALSE, 
+                          column_title_gp = gpar(fontsize=10),
+                          column_title_rot = 90,
+                          top_annotation_height=unit(1.0,"cm"), 
+                          top_annotation=acol_annots[[5]],
+                          show_row_names = FALSE, 
+                          show_heatmap_legend = FALSE) +
+  ComplexHeatmap::Heatmap(amat_list[[6]], column_title=names(amat_list)[[6]],
+                          show_column_names = FALSE, 
+                          column_title_gp = gpar(fontsize=10),
+                          column_title_rot = 90,
+                          top_annotation_height=unit(1.0,"cm"), 
+                          top_annotation=acol_annots[[6]],
+                          show_row_names = FALSE, 
+                          show_heatmap_legend = FALSE) +
+  ComplexHeatmap::Heatmap(amat_list[[7]], name="Expression", column_title=names(amat_list)[[7]],
+                          show_column_names = FALSE,
+                          column_title_gp = gpar(fontsize=10),
+                          column_title_rot = 90,
+                          top_annotation_height=unit(1.0,"cm"), 
+                          top_annotation=acol_annots[[7]],
+                          show_row_names = TRUE,
+                          row_names_gp = gpar(fontsize = 8),
+                          row_names_max_width = unit(15,"cm"))
+#dev.off()
+
+```
+
+
+

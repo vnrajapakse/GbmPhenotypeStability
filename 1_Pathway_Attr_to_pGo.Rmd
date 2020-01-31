@@ -1,0 +1,242 @@
+---
+title: "Mapping full-length attractors to pathway attractors with associated pGo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r prep_data, warning=FALSE, message=FALSE}
+library(tidyverse)
+
+library(GbmPhenotypeStability)
+source('R/utils.R')
+source('R/gbmdyn.R')
+
+inattr_tab <- GbmPhenotypeStability::input_attr_df %>%
+  filter(drug_targets == 'none')
+
+inphenoprob_tab <- GbmPhenotypeStability::input_pheno_prob_df %>%
+  filter(drug_targets == 'none') %>%
+  select(-drug_targets)
+stopifnot(identical(sort(unique(inattr_tab$input_uid)), 
+                    sort(unique(inphenoprob_tab$input_uid))))
+# TO DO: double check input uid-specific probabilities w.r.t.
+#        to counts in inattr_tab.
+
+# We now extract from the input-attractor table (inattr_tab) a table
+# of 320 unique input states (input_tab) and another table with
+# 272 unique attractor states (attr_tab); the latter includes the
+# input states leading to each attractor.
+
+input_tab <- inattr_tab %>%
+  select(input_uid, EGF:Hyaluronan) %>%
+  unique()
+stopifnot(identical(input_tab$input_uid, seq_len(nrow(input_tab))))
+
+attr_tab <- inattr_tab %>%
+  select(attr_uid, input_uid, phenotype) %>%
+  group_by(attr_uid) %>%
+  summarise(
+    input_uid = list(sort(unique(input_uid))),
+    phenotype = unique(phenotype)
+  ) %>%
+  ungroup() %>%
+  left_join(inattr_tab %>% select(attr_uid, Directed_Motility:pOLIG2) %>% unique(), 
+            by = 'attr_uid')
+```
+
+
+### Map Attractors to Reduced Pathway State Vectors
+```{r map_attr_to_pathway_states}
+map_attrs_to_pathway_states <- function(attr_tab) {
+  path_state_tbl <- tibble(
+    attr_uid = attr_tab$attr_uid,
+    phenotype = attr_tab$phenotype,
+    # ~ GROW ----------------------------------------
+    HALLMARK_E2F_TARGETS = 0,
+    HALLMARK_PI3K_AKT_MTOR_SIGNALING = 0,
+    HALLMARK_MYC_TARGETS_V1 = 0,
+    HALLMARK_WNT_BETA_CATENIN_SIGNALING = 0,
+    # ~ GO ------------------------------------------
+    HALLMARK_TGF_BETA_SIGNALING = 0,
+    HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION = 0,
+    HALLMARK_HYPOXIA = 0,
+    BIOCARTA_RHO_PATHWAY = 0,
+    PID_CDC42_PATHWAY = 0,
+    BIOCARTA_RAC1_PATHWAY = 0,
+    # ~ DNA DAMAGE/REPAIR ---------------------------
+    HALLMARK_DNA_REPAIR = 0,
+    # ~ APOPTOSIS/SURVIVAL --------------------------
+    HALLMARK_APOPTOSIS = 0,
+    HALLMARK_P53_PATHWAY = 0,
+    HALLMARK_TNFA_SIGNALING_VIA_NFKB = 0
+  )
+  stopifnot(all(!duplicated(colnames(path_state_tbl))))
+  
+  for (i in seq_len(nrow(attr_tab))) {
+    # ~ GROW ----------------------------------------
+    path_state_tbl[[i, 'HALLMARK_E2F_TARGETS']] = attr_tab[[i, 'Cell_Cycle']]
+    path_state_tbl[[i, 'HALLMARK_PI3K_AKT_MTOR_SIGNALING']] = attr_tab[[i, 'AKT']]
+    path_state_tbl[[i, 'HALLMARK_MYC_TARGETS_V1']] = attr_tab[[i, 'MYC']]
+    path_state_tbl[[i, 'HALLMARK_WNT_BETA_CATENIN_SIGNALING']] = attr_tab[[i, 'BetaCatenin_LEF1']]
+    # ~ GO ------------------------------------------
+    path_state_tbl[[i, 'HALLMARK_TGF_BETA_SIGNALING']] = attr_tab[[i, 'SMAD_2_3_4']]
+    path_state_tbl[[i, 'HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION']] = attr_tab[[i, 'SNAIL']]
+    path_state_tbl[[i, 'HALLMARK_HYPOXIA']] = attr_tab[[i, 'HIF']]
+    path_state_tbl[[i, 'BIOCARTA_RHO_PATHWAY']] = attr_tab[[i, 'RHOA']]
+    path_state_tbl[[i, 'PID_CDC42_PATHWAY']] = attr_tab[[i, 'CDC42']]
+    path_state_tbl[[i, 'BIOCARTA_RAC1_PATHWAY']] = attr_tab[[i, 'RAC1']]
+    # ~ DNA DAMAGE/REPAIR ---------------------------
+    path_state_tbl[[i, 'HALLMARK_DNA_REPAIR']] = attr_tab[[i, 'ATM']]
+    # ~ APOPTOSIS/SURVIVAL --------------------------
+    path_state_tbl[[i, 'HALLMARK_APOPTOSIS']] = attr_tab[[i, 'Apoptosis']]
+    path_state_tbl[[i, 'HALLMARK_P53_PATHWAY']] = attr_tab[[i, 'TP53']]
+    path_state_tbl[[i, 'HALLMARK_TNFA_SIGNALING_VIA_NFKB']] = attr_tab[[i, 'NFKB']]
+  }
+  
+  return(path_state_tbl)
+}
+
+# Each row gives the pathway state mapping for a distinct full-length attractor.
+# But - the compression means that there are identical rows excluding the 
+# attr_uid, i.e., distinct attractors map can map to a single pwattr.
+tmp <- map_attrs_to_pathway_states(attr_tab)
+
+# Table unique pathway-level attractors.
+pwattr_tbl <- tmp %>%
+  select(HALLMARK_E2F_TARGETS:HALLMARK_TNFA_SIGNALING_VIA_NFKB) %>%
+  unique() %>%
+  add_column(pwattr_uid = seq_len(nrow(.)), .before = 'HALLMARK_E2F_TARGETS')
+
+tmp <- tmp %>%
+  # Adding pwattr_uid column.
+  left_join(pwattr_tbl, by = colnames(pwattr_tbl)[-1]) %>%
+  # Adding attr_uid-matched input_uids column.
+  left_join(attr_tab %>% select(attr_uid, input_uid), by = 'attr_uid') %>%
+  # Droping pathway component state columns.
+  select(attr_uid, input_uid, pwattr_uid, phenotype) %>%
+  # Summarising at the pwattr_uid level.
+  group_by(pwattr_uid) %>%
+  summarise_all(.funs = function(x) { list(sort(unique(c(x, recursive = TRUE)))) }) %>%
+  ungroup()
+
+pwattr_tbl <- tmp %>%
+  left_join(pwattr_tbl, by = 'pwattr_uid')
+  
+#attr_pwstates <- pwattr_tbl[, -(1:4)]
+```
+
+
+### Expand Pathway Attractor-Associated Input States Using Perturbations
+```{r add_sim_input_states}
+get_similar_input_states <- function(uids, input_tab, max_errs) {
+  stopifnot(identical(input_tab[[1]], seq_len(nrow(input_tab))))
+  stopifnot(all(uids %in% input_tab[[1]]))
+  stopifnot(max_errs >= 0)
+  
+  S = as.matrix(input_tab)[, -1, drop = FALSE]
+  stopifnot(is.numeric(S))
+  matched_uids <- NULL
+  
+  for (i in uids) {
+    S_i <- unname(S[i, , drop = TRUE])
+    err_counts <- apply(S, MARGIN = 1, FUN = function(x) { sum(x != S_i) })
+    matched_uids <- c(matched_uids, which(err_counts <= max_errs))
+  }
+  
+  return(sort(unique(matched_uids)))
+}
+
+pwattr_tbl <- pwattr_tbl %>%
+  mutate(
+    input_uid_pert = map(input_uid, .f = get_similar_input_states, 
+                         input_tab = input_tab, max_errs = 1),
+    n_input_uid_pert = map_int(input_uid_pert, length)
+  ) %>%
+  select(pwattr_uid, attr_uid, input_uid, input_uid_pert, n_input_uid_pert, 
+         phenotype, everything())
+
+
+```
+
+
+### Compute Go State Probability Under Input Perturbation for each Pathway Attractor
+```{r add_go_state_probability}
+get_pheno_prob <-  function(uids, inphenoprob_tab, state) {
+  stopifnot(state %in% c("Grow", "Go", "Dormant", "Apoptosis"))
+  stopifnot(all(uids %in% inphenoprob_tab$input_uid))
+  
+  x <- inphenoprob_tab %>% filter(input_uid %in% uids) %>% pull(state)
+  p <- sum(x / length(x))
+  
+  return(p)
+}
+
+pwattr_tbl <- pwattr_tbl %>%
+  mutate(
+    p_Go = map_dbl(input_uid_pert, .f = get_pheno_prob, 
+      inphenoprob_tab = inphenoprob_tab, state = 'Go'),
+    p_Grow = map_dbl(input_uid_pert, .f = get_pheno_prob, 
+      inphenoprob_tab = inphenoprob_tab, state = 'Grow'),
+    p_Dormant = map_dbl(input_uid_pert, .f = get_pheno_prob, 
+      inphenoprob_tab = inphenoprob_tab, state = 'Dormant'),
+    p_Apoptosis = map_dbl(input_uid_pert, .f = get_pheno_prob, 
+      inphenoprob_tab = inphenoprob_tab, state = 'Apoptosis'),
+    p_All = p_Go + p_Grow + p_Dormant + p_Apoptosis
+  ) %>%
+  select(pwattr_uid, p_Go, p_Grow, p_Dormant, p_Apoptosis, p_All, everything())
+
+stopifnot(all(near(pwattr_tbl$p_All, 1)))
+
+pwattr_tbl <- select(pwattr_tbl, -p_All)
+
+```
+
+
+## Done with main data preparation (pwattr_tbl)
+
+---------------------------------------------------------------------------------------------------
+
+```{r}
+stopifnot(identical(pwattr_tbl, GbmPhenotypeStability::pwattr_tbl))
+
+# tmp <- readxl::read_xlsx(
+#    "~/Dropbox/manuscripts/gbm_manuscript/Submission_Version/Table_S4_pathway_attractor_table.xlsx",
+#    sheet = 2) %>%
+#    mutate(pwattr_uid = as.integer(pwattr_uid))
+# 
+# stopifnot(
+#   identical(tmp$pwattr_uid, pwattr_tbl$pwattr_uid),
+#   all(near(tmp$p_Go, pwattr_tbl$p_Go))
+# )
+
+# mutate_if(pwattr_tbl, is.list, function(L) { map_chr(L, paste0, collapse = ", ") }) %>%
+#   writexl::write_xlsx("inst/extdata/Sup_Tables/Table_S4_pathway_attractor_table.xlsx")
+```
+
+```{r}
+# pwattr_tbl %>%
+#   arrange(p_Go, p_Grow, p_Dormant, p_Apoptosis, desc(pwattr_uid)) %>%
+#   mutate(
+#     pwattr_uid = factor(as.character(pwattr_uid), levels = as.character(pwattr_uid))
+#     ) %>%
+#   select(pwattr_uid, p_Go:p_Apoptosis) %>%
+#   gather(key = "phenotype", value = "probability", p_Go:p_Apoptosis) %>%
+#   mutate(
+#     phenotype = factor(phenotype, levels = rev(c("p_Go", "p_Grow", "p_Dormant", "p_Apoptosis")))
+#   ) %>%
+#   ggplot(aes(x = pwattr_uid, y = probability, fill = phenotype)) +
+#   geom_bar(position="fill", stat="identity") +
+#   scale_fill_manual("p_Phenotype", 
+#                     values = c("p_Go" = "forestgreen", "p_Grow" = "blue", 
+#                                "p_Dormant" = "grey", "p_Apoptosis" = "red")) +
+#   xlab("Pathway-Level Attractor ID") +
+#   ylab("Probability") +
+#   ggtitle("Phenotypic Stability for Theoretical Pathway-Level Attractor States") +
+#   coord_flip() +
+#   ggsave(filename = "revision_figs/pwattr_p_phenotypes.pdf", width = 8, height = 8)
+
+```
+

@@ -1,0 +1,442 @@
+---
+title: "Mapping IVY-GAP Samples to Theoretical Pathway-Level Attractors w/p_Go"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r prep_data, warning=FALSE, message=FALSE}
+library(tidyverse)
+
+library(GbmPhenotypeStability)
+source('R/utils.R')
+source('R/gbmdyn.R')
+
+# set parameters ----------------------------------------------
+ivx <- GbmPhenotypeStability::ivygap$exp %>% rename(gene = gene_symbol)
+iva <- GbmPhenotypeStability::ivygap$samples
+pathways <- GbmPhenotypeStability::hmgsets_full
+pwattr_tbl <- GbmPhenotypeStability::pwattr_tbl
+# -------------------------------------------------------------
+attr_pwstates <- pwattr_tbl %>%
+  select(HALLMARK_E2F_TARGETS:HALLMARK_TNFA_SIGNALING_VIA_NFKB)
+
+stopifnot(identical(iva$sample_id, colnames(ivx)[-1]))
+
+ivx <- ivx %>% select(c('gene', iva$sample_id))
+stopifnot(identical(iva$sample_id, colnames(ivx)[-1]))
+
+xmat <- tbl_to_mat(ivx, 'gene')
+stopifnot(identical(colnames(xmat), iva$sample_id))
+
+sample_pwstates <- map_sample_exp_to_pathway_states(
+  xmat,
+  pathways
+) %>%
+mutate_all(function(x) { 
+  (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+  }
+)
+rownames(sample_pwstates) <- colnames(xmat)
+
+pwact_mat <- sample_pwstates %>% as.matrix() %>% t()
+sample2loc <- purrr::set_names(iva$location, iva$sample_id)
+
+```
+
+---------------------------------------------------------------------------------------------------
+
+### Ordered Pathway Activities
+```{r ordered_pwact}
+pltpwact_tbl <- sample_pwstates %>%
+  rownames_to_column(var = 'sample_id') %>%
+  gather(key = 'pathway', value = 'pathway_act', colnames(.)[-1]) %>%
+  group_by(pathway) %>%
+  mutate(
+    rank = rank(pathway_act, ties.method = 'first')
+    ) %>%
+  ungroup() %>%
+  arrange(pathway, rank)
+
+shapiro_test_pval <-  function(x) { shapiro.test(x)$p.value }
+dip_test_pval <- function(x) {diptest::dip.test(x)$p.value }
+
+set.seed(1)
+pwactqtl_tbl <- pltpwact_tbl %>%
+  select(pathway, pathway_act) %>%
+  group_by(pathway) %>%
+  summarise(
+    pathway_act_q50 = quantile(pathway_act, 0.50),
+    pathway_act_q75 = quantile(pathway_act, 0.75),
+    shapiro_test_pval = shapiro_test_pval(pathway_act),
+    dip_test_pval = dip_test_pval(pathway_act)
+    ) %>%
+  ungroup() %>%
+  arrange(pathway_act_q50)
+
+```
+
+
+# Plots to justify median-thresholding of scaled pathway score values
+```{r}
+plt_sample_pwstates <- sample_pwstates %>%
+  rownames_to_column(var = "sample_id") %>%
+  gather(key = "pathway", value = "activity", 
+         HALLMARK_E2F_TARGETS:HALLMARK_TNFA_SIGNALING_VIA_NFKB) %>%
+  left_join(pwactqtl_tbl, by = "pathway") %>%
+  mutate(
+    pathway = ifelse(pathway == "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+                     "HALLMARK_EMT", pathway)
+  )
+  
+ggplot(plt_sample_pwstates, aes(x = activity)) +
+  geom_histogram(aes(y=..density..), bins = 20, alpha = 0.6) + 
+  geom_density(aes(y=..density..), color = "blue") +
+  facet_wrap(~pathway) +
+  geom_vline(aes(xintercept = pathway_act_q50), col = 'red', size = 0.75) +
+  theme(strip.text = element_text(size = 8)) +
+  ggtitle("Distribution of Scaled GSEA Pathway Activities for IVY-GAP Samples") +
+  xlab("pathway activity") 
+
+```
+
+
+
+-----
+
+### Binarizing Pathway-Level Activity Data and Matching to Attractors
++ Pathway-specific binarization (< median ---> 0, >= median ---> 1)
++ Each binary sample pathway activity vector is matched to a (binary, pathway-level)
+  attractor based on the following rules:
+    + Each of 'HALLMARK_E2F_TARGETS', 'HALLMARK_APOPTOSIS' must match exactly.
+    + At least 2 of the GO pathways ('BIOCARTA_RAC1_PATHWAY', 'PID_CDC42_PATHWAY',   
+      'BIOCARTA_RHO_PATHWAY') must match exactly.
+    + Among attractors satisfying the above, the best match by Jaccard score is selected.
++ Match table is filtered to Jaccard scores > 0.5 (and satisfying the noted pathway match
+  constraints, which essentially force strict(er) matching of Grow/Go/Apoptosis effector 
+  pathways).
++ The Jaccard Score between binary vectors x and y is sum(x & y) / sum(x | y), where
+  & and | are bitwise AND and OR, respectively.
+```{r util_functions}
+
+is_pheno_mutex <-  function(x) {
+  grow      <- x[["HALLMARK_E2F_TARGETS"]]
+  apoptosis <- x[["HALLMARK_APOPTOSIS"]]
+  
+  go_pathways <- c("BIOCARTA_RHO_PATHWAY", "PID_CDC42_PATHWAY", "BIOCARTA_RAC1_PATHWAY")
+  go <- (3 == sum(x[go_pathways])) %>% as.integer()
+  
+  dormant <- (0 == (grow + go + apoptosis))  %>% as.integer()
+  
+  return(1 == (go + grow + dormant + apoptosis))
+}
+
+binarize_pwact <- function(sample_pwstates, pwact_thresholds, require_pheno_mutex = FALSE) {
+  stopifnot(all(colnames(sample_pwstates) %in% names(pwact_thresholds)))
+  binact <- sample_pwstates
+  for (pw in colnames(binact)) {
+    binact[[pw]] <- as.integer(binact[[pw]] > pwact_thresholds[[pw]])
+  }
+  if (!require_pheno_mutex) { return(binact) }
+  
+  # ---------------------------------------------------------------------------
+  binarization_confidence <- function() {
+    pwa <- sample_pwstates %>% as.data.frame() %>% as.matrix()
+    stopifnot(!is.null(rownames(pwa)), !is.null(colnames(pwa)),
+              identical(rownames(pwa), rownames(sample_pwstates)),
+              identical(colnames(pwa), colnames(sample_pwstates)))
+    pwa_medians <- apply(pwa, 2, median)
+    pwa_mads    <- apply(pwa, 2, mad)
+    stopifnot(identical(pwa_medians, pwact_thresholds[names(pwa_medians)]))
+    
+    # Per col: subtract column (pathway) median, divide by column MAD.
+    binconf <- sweep(pwa,     MARGIN = 2, STATS = pwa_medians, FUN = "-")
+    binconf <- sweep(binconf, MARGIN = 2, STATS = pwa_mads,    FUN = "/")
+    # check ----------------------------------------------------
+    for (i in seq_len(nrow(binconf))) {
+      for (j in seq_len(ncol(binconf))) {
+        conf_ij <- (pwa[[i, j]] - pwa_medians[[j]]) / pwa_mads[[j]]
+        stopifnot(dplyr::near(conf_ij, binconf[[i, j]]))
+      }
+    }
+    # ----------------------------------------------------------
+    return(binconf)
+  }
+  
+  #if (require_pheno_mutex) {
+  binconf <- binarization_confidence()
+  binpwa <- binact %>% as.data.frame() %>% as.matrix()
+  stopifnot(identical(binconf > 0, binpwa == 1))
+  
+  go_pathways <- c("BIOCARTA_RHO_PATHWAY", "PID_CDC42_PATHWAY", "BIOCARTA_RAC1_PATHWAY")
+  
+  for (i in seq_len(nrow(binpwa))) {
+    if (is_pheno_mutex(binpwa[i, , drop = TRUE])) { next }
+    
+    go_pw_conf_scores <- binconf[i, go_pathways, drop = TRUE]
+    min_conf_go_pathway <- names(go_pw_conf_scores[which.min(go_pw_conf_scores)])
+    
+    pheno_conf_scores <- c(
+      grow = binconf[i, "HALLMARK_E2F_TARGETS"],
+      go   = min(go_pw_conf_scores),
+      apoptosis = binconf[i, "HALLMARK_APOPTOSIS"]
+    )
+    pheno_conf_scores <- ifelse(pheno_conf_scores > 0, pheno_conf_scores, 0)
+    max_conf_pheno <- names(pheno_conf_scores[which.max(pheno_conf_scores)])
+    
+    if (max_conf_pheno == "go") {
+      stopifnot(sum(binpwa[i, go_pathways]) == 3)
+      binpwa[i, "HALLMARK_E2F_TARGETS"] <- 0
+      binpwa[i, "HALLMARK_APOPTOSIS"]   <- 0
+    } 
+    
+    if (max_conf_pheno == "grow") {
+      stopifnot(binpwa[i, "HALLMARK_E2F_TARGETS"] == 1)
+      binpwa[i, "HALLMARK_APOPTOSIS"]   <- 0
+    }
+    
+    if (max_conf_pheno == "apoptosis") {
+      stopifnot(binpwa[i, "HALLMARK_APOPTOSIS"] == 1)
+      binpwa[i, "HALLMARK_E2F_TARGETS"] <- 0
+    }
+    
+    if ((max_conf_pheno == "grow") || (max_conf_pheno == "apoptosis")) {
+      if (pheno_conf_scores[["go"]] > 0) {
+        stopifnot(sum(binpwa[i, go_pathways]) == 3)
+        binpwa[i, min_conf_go_pathway] <- 0
+      }
+    }
+  }
+  
+  stopifnot( all(apply(binpwa, 1, function(x) { is_pheno_mutex(x) })) )
+  tmp <- binpwa %>% 
+    as.data.frame() %>%
+    rownames_to_column(var = "sample_id") %>%
+    as_tibble() %>%
+    column_to_rownames(var = "sample_id")
+  stopifnot(
+    identical(rownames(tmp), rownames(binact)),
+    identical(colnames(tmp), colnames(binact)))
+  binact <- tmp
+
+  return(binact)
+}
+
+
+score_mismatches <- function(x, y) {
+  stopifnot(length(x) == length(y))
+  result <- list()
+  result[['err_count']] <- sum(x != y)
+  result[['err_frac']]  <- result[['err_count']] / length(x)
+  return(result)
+}
+
+
+score_jaccard <- function(x, y, must_match = NULL, part_match = NULL, k = 1) {
+  stopifnot(length(x) == length(y), 
+            all(c(x, y) %in% c(0, 1)),
+            length(intersect(must_match, part_match)) == 0)
+  x <- purrr::set_names(as.logical(x), names(x))
+  y <- purrr::set_names(as.logical(y), names(y))
+  result <- list()
+  result[['jaccard_score']] <- sum(x & y) / sum(x | y)
+  if (!all(x[must_match] == y[must_match])) {
+    result[['jaccard_score']] <- 0
+  }
+  if (sum(x[part_match] == y[part_match]) < k) {
+    result[['jaccard_score']] <- 0
+  }
+  return(result)
+}
+
+score_jaccard_broadhm = function(x, y) {
+  score_jaccard(x, y, must_match = c(
+    'HALLMARK_E2F_TARGETS',
+    'HALLMARK_APOPTOSIS'
+  ),
+  part_match = c(
+    'BIOCARTA_RAC1_PATHWAY',
+    'PID_CDC42_PATHWAY',
+    'BIOCARTA_RHO_PATHWAY'
+  ),
+  k = 2
+  )
+}
+
+
+match_binary_attrs <- function(X, Y, score_func,
+                               X_ids=NULL, Y_ids = NULL, use_min_score = TRUE) {
+  stopifnot(identical(colnames(X), colnames(Y)))
+  if (!is.null(X_ids)) {
+    stopifnot(length(X_ids) == nrow(X), is.null(names(X_ids)))
+  }
+  if (!is.null(Y_ids)) {
+    stopifnot(length(Y_ids) == nrow(Y), is.null(names(Y_ids)))
+  }
+  
+  match_tbl <- data.frame(
+    id_X = seq_len(nrow(X)),
+    id_Y = NA,
+    stringsAsFactors = FALSE
+  )
+  
+  tbl_row_to_vec <- function(k, tb) {
+    set_names(as.numeric(tb[k, ]), colnames(tb))
+  }
+  
+  # Set additional columns based on (dummy) score function result.
+  tmp <- score_func(tbl_row_to_vec(1, X), tbl_row_to_vec(1, X))
+  for (cname in names(tmp)) { match_tbl[[cname]] <- NA }
+  match_tbl <- as_tibble(match_tbl)
+  
+  for (i in seq_len(nrow(X))) {
+    X_i <- tbl_row_to_vec(i, X)
+    score_func_results  <- vector(mode = 'list', length = nrow(Y))
+    
+    for (j in seq_len(nrow(Y))) {
+      Y_j <- tbl_row_to_vec(j, Y)
+      score_func_results[[j]] <- score_func(X_i, Y_j)
+    }
+    
+    score_vals <- map_dbl(score_func_results, function(L) L[[1]])
+    if (use_min_score) {
+      j_match <- which.min(score_vals)
+    } else {
+      j_match <- which.max(score_vals)
+    }
+    best_result <- score_func_results[[j_match]]
+    
+    match_tbl[[i, 'id_Y']] <- j_match
+    for (cname in names(best_result)) {
+      match_tbl[[i, cname]] <- best_result[[cname]]
+    }
+  }
+  
+  if (!is.null(X_ids)) {
+    match_tbl[['id_X']] <- X_ids[match_tbl[['id_X']]]
+  }
+  if (!is.null(Y_ids)) {
+    match_tbl[['id_Y']] <- Y_ids[match_tbl[['id_Y']]]
+  }
+  
+  return(match_tbl)
+}
+
+
+get_sample_pwattr_match_tbl <- function(
+  pwact_thresholds,
+  sample_pwstates,
+  attr_pwstates,
+  score_func,
+  score_colname,
+  use_min_score,
+  sample_meta,
+  pwattr_meta,
+  score_threshold = 0.5
+) {
+  sample_binpwact <- binarize_pwact(sample_pwstates, pwact_thresholds)
+  
+  match_tbl <- match_binary_attrs(
+  X = sample_binpwact, X_ids = rownames(sample_binpwact),
+  Y = attr_pwstates, Y_ids = rownames(attr_pwstates),
+  score_func = score_func,
+  use_min_score = use_min_score
+  ) %>%
+  rename(
+    sample_id = id_X,
+    pwattr_uid = id_Y
+  ) %>%
+  mutate(
+    pwattr_uid = as.integer(pwattr_uid)
+  ) %>%
+  left_join(pwattr_meta, by = 'pwattr_uid') %>%
+  left_join(sample_meta, by = 'sample_id')
+  
+  if (use_min_score) {
+    selector <- match_tbl[[score_colname]] < score_threshold
+  } else {
+    selector <- match_tbl[[score_colname]] > score_threshold
+  }
+  
+  match_tbl %>% filter(selector)
+}
+```
+
+
+```{r attr_matching}
+median_thresholds <- deframe(pwactqtl_tbl %>% select(pathway, pathway_act_q50))
+
+match_tbl <- get_sample_pwattr_match_tbl(
+  pwact_thresholds = median_thresholds,
+  sample_pwstates = sample_pwstates,
+  attr_pwstates = attr_pwstates,
+  score_func = score_jaccard_broadhm,
+  score_colname = 'jaccard_score',
+  use_min_score = FALSE,
+  sample_meta = iva %>% select(sample_id, location, stem_cluster_status),
+  pwattr_meta = pwattr_tbl %>% select(pwattr_uid, p_Go),
+  score_threshold = 0.5
+) %>%
+  left_join(select(pwattr_tbl, pwattr_uid, p_Grow, p_Dormant, p_Apoptosis),
+            by = "pwattr_uid") %>%
+  select(sample_id, pwattr_uid, jaccard_score, p_Go, p_Grow, p_Dormant, p_Apoptosis,
+         everything())
+
+stopifnot(select(match_tbl, p_Go:p_Apoptosis) %>%
+            mutate(p_All = p_Go + p_Grow + p_Dormant + p_Apoptosis) %>%
+            pull(p_All) %>% 
+            near(1) %>%
+            all())
+
+stopifnot(identical(match_tbl, GbmPhenotypeStability::ivygap$pwattr_match_tbl))
+# ivygap <- GbmPhenotypeStability::ivygap
+# ivygap$pwattr_match_tbl <- match_tbl
+# save(ivygap, file = "data/ivygap.RData")
+```
+
+-------------------------------------------------------------------------------
+
+### Write Out Supplementary Table
+
+```{r}
+ivygap_pwattr_pGo_tbl <- GbmPhenotypeStability::ivygap$pwattr_match_tbl %>%
+  left_join(pwattr_tbl %>% select(pwattr_uid, phenotype,
+                                  HALLMARK_E2F_TARGETS:HALLMARK_TNFA_SIGNALING_VIA_NFKB), 
+            by = "pwattr_uid") %>%
+  rename(
+    ivygap_sample_id = sample_id, 
+    pwattr_phenotype = phenotype
+    ) %>%
+  mutate(
+    pwattr_phenotype = purrr::map_chr(pwattr_phenotype, function(s) { paste0(s, collapse = ", ") })
+    )%>%
+  select(ivygap_sample_id, pwattr_uid, pwattr_phenotype, everything()) %>%
+  arrange(p_Go)
+
+# CHECK -----------------------------------------------------------------------
+# tmp <- readxl::read_xlsx(
+#   "~/Dropbox/manuscripts/gbm_manuscript/Submission_Version/Table_S5_ivygap_pwattractor_pGo_table.xlsx") %>%
+#   mutate(
+#     ivygap_sample_id = as.character(ivygap_sample_id),
+#     pwattr_uid = as.integer(pwattr_uid)
+#     ) %>%
+#   arrange(p_Go)
+# 
+# stopifnot(
+#   identical(
+#     ivygap_pwattr_pGo_tbl %>% select(-jaccard_score, -p_Go, -p_Grow, -p_Dormant, -p_Apoptosis),
+#     tmp %>% select(-jaccard_score, -p_Go)
+#   ),
+#   all(near(ivygap_pwattr_pGo_tbl$p_Go, tmp$p_Go)),
+#   all(near(ivygap_pwattr_pGo_tbl$jaccard_score, tmp$jaccard_score))
+# )
+# -----------------------------------------------------------------------------
+
+# writexl::write_xlsx(
+#   ivygap_pwattr_pGo_tbl, 
+#   "inst/extdata/Sup_Tables/Table_S5_ivygap_pwattractor_pGo_table.xlsx")
+
+```
+

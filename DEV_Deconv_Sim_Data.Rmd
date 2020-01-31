@@ -1,0 +1,144 @@
+---
+title: "Pathway Activity in IVY-GAP"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Set Up: IVY-GAP exp data matrix for BN-associated genes, attractor matched samples
+```{r}
+library(tidyverse)
+
+X <- GbmPhenotypeStability::ivygap$exp %>% 
+  rename(gene = gene_symbol) %>%
+  as.data.frame() %>%
+  column_to_rownames(var = "gene") %>%
+  as.matrix()
+
+bn_gene_tbl <- readr::read_tsv('inst/extdata/gbm_bn_genes.txt', col_types = cols())
+bngenes <- na.exclude(c(bn_gene_tbl[[1]], bn_gene_tbl[[2]])) %>%
+  stringr::str_split(pattern = '\\s+') %>%
+  c(recursive = TRUE) %>%
+  unique() %>% sort() %>%
+  intersect(rownames(X))
+
+stopifnot(all(bngenes %in% rownames(X)))
+stopifnot(all(GbmPhenotypeStability::ivygap$pwattr_match_tbl$sample_id %in% colnames(X)))
+X <- X[bngenes, GbmPhenotypeStability::ivygap$pwattr_match_tbl$sample_id, drop = FALSE]
+
+```
+
+
+
+
+# Assess reconstruction error using nnls
+```{r}
+
+l2norm <- function(x) { norm(as.matrix(x), type = "F") }
+
+noise_with_norm <- function(d, l2norm_val) {
+  #e <- runif(d, min = -1, max = 1)
+  e <- rnorm(d)
+  l2norm_val * (e / l2norm(e))
+}
+
+relative_err <- function(x, y) { l2norm(x - y) / l2norm(y) }
+
+#mix_samples <- rand_samples
+#mix_fracs   <- rand_mix_fracs
+estimate_mixture_fracs <- function(X, mix_samples, mix_fracs, noise_level = 0, rseed = 1) {
+  set.seed(rseed)
+  stopifnot(identical(dim(mix_samples), dim(mix_fracs)))
+  stopifnot(all(near(rowSums(mix_fracs), 1)))
+  n_trials <- nrow(mix_samples)
+  k <- ncol(mix_samples)
+  d <- nrow(X) # data dimension
+  
+  #est_mix_fracs <- matrix(0, nrow = n_trials, ncol = k)
+  act_mix_coeffs <- vector(mode = "list", length = n_trials)
+  est_mix_coeffs <- vector(mode = "list", length = n_trials)
+  
+  
+  for (i in seq_len(n_trials)) {
+    mix_samples_i <- colnames(X)[mix_samples[i, , drop = TRUE]]
+    mix_fracs_i   <- mix_fracs[i, , drop = TRUE]
+    
+    y <-  (X[, mix_samples_i] %*%  mix_fracs_i) %>% .[, 1]
+    if (noise_level > 0) {
+      y_pert <- y + noise_with_norm(d, noise_level * l2norm(y))
+      stopifnot(near(relative_err(y_pert, y), noise_level))
+    } else {
+      y_pert <- y
+    }
+    nnls_out <- nnls::nnls(A = X, b = y_pert)
+    
+    w <- set_names(nnls_out$x, colnames(X))
+    sample_set <- c(names(w[w != 0]), mix_samples_i) %>% unique()
+    w <- w[sample_set]
+    w <- w / sum(abs(w))
+    
+    w_actual <- setNames(vector(mode = "numeric", length(sample_set)), sample_set)
+    w_actual[mix_samples_i] <- mix_fracs_i
+    
+    est_mix_coeffs[[i]] <- w
+    act_mix_coeffs[[i]] <- w_actual
+  }
+  
+  results <- list()
+  #results[["est_mix_fracs"]] <- est_mix_fracs
+  results[["relative_errs"]] <- purrr::map2_dbl(
+    est_mix_coeffs, act_mix_coeffs, function(x, y) {
+      stopifnot(identical(names(x), names(y)))
+      relative_err(x, y)
+  })
+  results[["median_relative_err"]] <- quantile(results[["relative_errs"]], 
+                                               probs = 0.50, na.rm = TRUE)
+  stopifnot(mean(is.na(results$median_relative_err)) < 0.1)
+  
+  return(results)
+}
+
+  
+```
+
+
+```{r}
+deconv_err_tbl <- tibble(
+  noise_level = seq(0, 0.10, by = 0.01),
+  median_rel_mix_coeff_err = purrr::map_dbl(noise_level, function(e) {
+    N = 1000 # Number of random mixtures
+    k = 3   # Number of mixture components
+
+    # Matrix of N k-component random mixture proportions.
+    rand_mix_fracs <- matrix(runif(N*k), nrow = N, ncol = k) %>%
+      sweep(., MARGIN = 1, STATS = rowSums(.), FUN = "/")
+    stopifnot(all(near(rowSums(rand_mix_fracs), 1)))
+    
+    # Matrix of N randomly selected sets of k samples (X matrix column indices)
+    rand_samples <- purrr::map(1:N, function(i) {
+      sample(1:ncol(X), size = k, replace = FALSE) %>% 
+        matrix(nrow = 1, ncol = k) %>%
+        as.data.frame()
+    }) %>% 
+      dplyr::bind_rows() %>%
+      as.matrix()
+    
+    estimate_mixture_fracs(X, rand_samples, rand_mix_fracs, 
+                           noise_level = e)$median_relative_err
+  })
+)
+
+ggplot(deconv_err_tbl, aes(noise_level, median_rel_mix_coeff_err)) +
+  geom_point() +
+  xlab("Noise Level") +
+  ylab("Median Relative Error") +
+  ggtitle("Median Relative Error Between True and Inferred Mixture Coefficient Vectors",
+          subtitle = "N = 1000 trials per noise level \n -- Each trial: estimate mixture coefficients with  w/fixed norm uniform random noise added to simulated target vector \n -- Simulated target vectors: random mixtures of 3 randomly selected IVY-GAP expression vectors \n                                               from deconvolution template set))") +
+  ggsave(filename = "inst/extdata/figs/simdata_deconv_coeff_errors.pdf", height = 10, width = 10)
+
+
+```
+
