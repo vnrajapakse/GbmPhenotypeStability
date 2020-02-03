@@ -11,8 +11,8 @@ knitr::opts_chunk$set(echo = FALSE)
 library(tidyverse)
 
 library(GbmPhenotypeStability)
-source('R/utils.R')
-source('R/gbmdyn.R')
+source('../R/utils.R')
+source('../R/gbmdyn.R')
 
 # set parameters ----------------------------------------------
 ivx <- GbmPhenotypeStability::ivygap$exp %>% rename(gene = gene_symbol)

@@ -11,8 +11,8 @@ knitr::opts_chunk$set(echo = FALSE)
 library(tidyverse)
 
 library(GbmPhenotypeStability)
-source('R/utils.R')
-source('R/gbmdyn.R')
+source('../R/utils.R')
+source('../R/gbmdyn.R')
 
 # set parameters ----------------------------------------------
 ivx <- GbmPhenotypeStability::ivygap$exp %>% rename(gene = gene_symbol)
@@ -44,7 +44,7 @@ rownames(sample_pwstates) <- colnames(xmat)
 pwact_mat <- sample_pwstates %>% as.matrix() %>% t()
 sample2loc <- purrr::set_names(iva$location, iva$sample_id)
 
-bn_gene_tbl <- readr::read_tsv('inst/extdata/gbm_bn_genes.txt')
+bn_gene_tbl <- readr::read_tsv('../inst/extdata/gbm_bn_genes.txt')
 bngenes <- na.exclude(c(bn_gene_tbl[[1]], bn_gene_tbl[[2]])) %>%
   stringr::str_split(pattern = '\\s+') %>%
   c(recursive = TRUE) %>%

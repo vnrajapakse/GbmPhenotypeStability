@@ -16,8 +16,8 @@ library(reactome.db)
 library(survival)
 
 library(GbmPhenotypeStability)
-source('R/utils.R')
-source('R/gbmdyn.R')
+source('../R/utils.R')
+source('../R/gbmdyn.R')
 
 library(tidyverse)
 
@@ -90,7 +90,7 @@ stopifnot(
   )
 
 # Define gene sets -------------------------------------------------------
-bn_gene_tbl <- readr::read_tsv('inst/extdata/gbm_bn_genes.txt')
+bn_gene_tbl <- readr::read_tsv('../inst/extdata/gbm_bn_genes.txt')
 bngenes <- na.exclude(c(bn_gene_tbl[[1]], bn_gene_tbl[[2]])) %>%
   stringr::str_split(pattern = '\\s+') %>%
   c(recursive = TRUE) %>%
@@ -109,7 +109,7 @@ ivx_mat <- ivx_mat[genes, , drop = FALSE]
 ### GBM Expression-Based Subtype Classification (Proneural, Classical, Mesenchymal)
 
 ```{r subtype_classification}
-gbm_subtype_tbl <- readr::read_tsv('inst/extdata/tcga_gbm_classification/NIHMS885291-supplement-3.txt',
+gbm_subtype_tbl <- readr::read_tsv('../inst/extdata/tcga_gbm_classification/NIHMS885291-supplement-3.txt',
                                    col_types = cols())
 
 identical(
@@ -721,7 +721,7 @@ p <- ggplot(fgseaRes_top, aes(x = reorder(pathway_label, NES), y = NES)) +
   theme(legend.position = 'none') +
   coord_flip()
 
-ggsave(p, filename = 'inst/extdata/figs/fig4_pgo_gsea.pdf', width = 12, height = 10)
+#ggsave(p, filename = '../inst/extdata/figs/fig4_pgo_gsea.pdf', width = 12, height = 10)
 
 ```
 
@@ -777,7 +777,7 @@ p2 <- ggplot(pgo_exp_plot_tbl, aes(x = exp, y = p_Go)) +
   xlab('exp: log2[FPKM + 1]') +
   labs(title = 'p_Go Gene Expression Correlates (TCGA GBM)')
 
-ggsave(p2, filename = 'inst/extdata/figs/fig4_pgo_gene_exp.pdf', width = 8, height = 8)
+#ggsave(p2, filename = '../inst/extdata/figs/fig4_pgo_gene_exp.pdf', width = 8, height = 8)
 ```
 
 

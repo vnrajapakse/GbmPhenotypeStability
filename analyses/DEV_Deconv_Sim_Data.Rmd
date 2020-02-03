@@ -18,7 +18,7 @@ X <- GbmPhenotypeStability::ivygap$exp %>%
   column_to_rownames(var = "gene") %>%
   as.matrix()
 
-bn_gene_tbl <- readr::read_tsv('inst/extdata/gbm_bn_genes.txt', col_types = cols())
+bn_gene_tbl <- readr::read_tsv('../inst/extdata/gbm_bn_genes.txt', col_types = cols())
 bngenes <- na.exclude(c(bn_gene_tbl[[1]], bn_gene_tbl[[2]])) %>%
   stringr::str_split(pattern = '\\s+') %>%
   c(recursive = TRUE) %>%
@@ -130,14 +130,14 @@ deconv_err_tbl <- tibble(
                            noise_level = e)$median_relative_err
   })
 )
-
-ggplot(deconv_err_tbl, aes(noise_level, median_rel_mix_coeff_err)) +
-  geom_point() +
-  xlab("Noise Level") +
-  ylab("Median Relative Error") +
-  ggtitle("Median Relative Error Between True and Inferred Mixture Coefficient Vectors",
-          subtitle = "N = 1000 trials per noise level \n -- Each trial: estimate mixture coefficients with  w/fixed norm uniform random noise added to simulated target vector \n -- Simulated target vectors: random mixtures of 3 randomly selected IVY-GAP expression vectors \n                                               from deconvolution template set))") +
-  ggsave(filename = "inst/extdata/figs/simdata_deconv_coeff_errors.pdf", height = 10, width = 10)
+# 
+# ggplot(deconv_err_tbl, aes(noise_level, median_rel_mix_coeff_err)) +
+#   geom_point() +
+#   xlab("Noise Level") +
+#   ylab("Median Relative Error") +
+#   ggtitle("Median Relative Error Between True and Inferred Mixture Coefficient Vectors",
+#           subtitle = "N = 1000 trials per noise level \n -- Each trial: estimate mixture coefficients with  w/fixed norm uniform random noise added to simulated target vector \n -- Simulated target vectors: random mixtures of 3 randomly selected IVY-GAP expression vectors \n                                               from deconvolution template set))") +
+#   ggsave(filename = "../inst/extdata/figs/simdata_deconv_coeff_errors.pdf", height = 10, width = 10)
 
 
 ```

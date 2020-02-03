@@ -11,8 +11,8 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 
 library(GbmPhenotypeStability)
-source('R/utils.R')
-source('R/gbmdyn.R')
+source('../R/utils.R')
+source('../R/gbmdyn.R')
 
 inattr_tab <- GbmPhenotypeStability::input_attr_df %>%
   filter(drug_targets == 'none')
